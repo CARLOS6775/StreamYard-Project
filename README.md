@@ -1,19 +1,3 @@
 Estructura del Proyecto
 
-streamyard-clone/
-├── backend/          # NestJS backend (puerto 3000)
-│   ├── src/
-│   │   ├── common/       # Decoradores, guards, interceptors, pipes
-│   │   ├── config/       # Configuracion de DB, JWT, Redis
-│   │   ├── modules/      # Modulos de negocio (auth, broadcasts, chat...)
-│   │   └── media/        # WebRTC (Mediasoup) + FFmpeg
-│   ├── docker-compose.yml
-│   └── .env.example
-├── frontend/         # Angular frontend (puerto 4200)
-│   ├── src/app/
-│   │   ├── core/        # Models, services, interceptors, guards
-│   │   ├── shared/      # Componentes reutilizables, pipes, directives
-│   │   ├── features/    # Modulos de negocio (auth, studio, broadcasts...)
-│   │   └── layouts/     # Layouts (auth, main, studio)
-│   └── environments/
-└── guia_arquitectura_streamyard.pdf  # Guia completa de arquitectura
+<img width="714" height="398" alt="image" src="https://github.com/user-attachments/assets/d85eb1e1-b680-42e1-9689-ab56cbd5134d" />

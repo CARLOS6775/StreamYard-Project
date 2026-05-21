@@ -1,0 +1,223 @@
+version: "3.8"
+
+# =================================================================
+#  StreamYard Clone - Infraestructura de Desarrollo
+# =================================================================
+#
+#  Comandos:
+#    Levantar todo:          docker compose up -d
+#    Ver logs:               docker compose logs -f
+#    Detener todo:           docker compose down
+#    Detener + borrar datos: docker compose down -v
+#    Reiniciar un servicio:  docker compose restart postgres
+#
+#  NOTA: Este archivo maneja SOLAMENTE la infraestructura (base de datos,
+#  cache, almacenamiento, video). El backend y frontend se ejecutan
+#  localmente con npm run start:dev / ng serve durante desarrollo.
+# =================================================================
+
+services:
+
+  # --- PostgreSQL 16 ---------------------------------------------------
+  # Base de datos relacional principal.
+  # Almacena: usuarios, workspaces, transmisiones, destinos, grabaciones,
+  # temas de marca, mensajes de chat.
+  #
+  # Acceso externo:
+  #   - Host: localhost
+  #   - Puerto: 5432
+  #   - User: postgres / Password: postgres / DB: streamyard_clone
+  #   - URL: postgresql://postgres:postgres@localhost:5432/streamyard_clone
+  #
+  # Administracion visual:
+  #   - pgAdmin: https://www.pgadmin.org/download/
+  #   - DBeaver: https://dbeaver.io/download/
+  #   - Tablas: se crean automaticamente al levantar el backend (synchronize: true)
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: streamyard-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: streamyard_clone
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - streamyard-net
+
+  # --- Redis 7 ---------------------------------------------------------
+  # Base de datos en memoria (clave-valor).
+  # Se usa para:
+  #   - Cache de sesiones de usuario
+  #   - Almacenar tokens JWT revocados (blacklist)
+  #   - Rate limiting por IP en endpoints sensibles
+  #   - Pub/Sub para sincronizar WebSocket entre multiples instancias
+  #
+  # Acceso externo:
+  #   - Host: localhost
+  #   - Puerto: 6379
+  #   - Sin password en desarrollo
+  #
+  # Administracion visual:
+  #   - RedisInsight: https://redis.com/redis-enterprise/redis-insight/
+  #   - Comando: redis-cli ping (debe responder PONG)
+
+  redis:
+    image: redis:7-alpine
+    container_name: streamyard-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - streamyard-net
+
+  # --- MinIO (S3-compatible) -------------------------------------------
+  # Servidor de almacenamiento de objetos compatible con Amazon S3.
+  # Se usa para:
+  #   - Logos e imagenes de marca (brand themes)
+  #   - Overlays (imagenes, GIFs)
+  #   - Grabaciones de transmisiones (archivos MP4/WebM)
+  #   - Thumbnails de transmisiones
+  #
+  # Puertos:
+  #   - 9000: API S3 (donde tu backend sube/baja archivos)
+  #   - 9001: Consola web de administracion
+  #
+  # Consola web (crea buckets desde aqui):
+  #   - URL: http://localhost:9001
+  #   - User: minioadmin / Password: minioadmin
+  #
+  # Buckets necesarios (crear desde la consola o con el init script):
+  #   - "brand-assets"   -> logos, overlays, fondos
+  #   - "recordings"     -> grabaciones de transmisiones
+  #   - "thumbnails"     -> miniaturas de videos
+  #
+  # IMPORTANTE: Los archivos subidos via SDK de AWS S3 apuntan a localhost:9000
+  # pero las URLs publicas deben usar localhost:9000 tambien (o tu dominio en prod).
+
+  minio:
+    image: minio/minio:latest
+    container_name: streamyard-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - streamyard-net
+
+  # --- MinIO Init (crea buckets al primer inicio) ----------------------
+  # Este contenedor se ejecuta UNA SOLA VEZ y crea los buckets necesarios.
+  # Despues de crearlos, se detiene automaticamente.
+  # Si ya existen los buckets, no hace nada.
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: streamyard-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 minioadmin minioadmin;
+      mc mb myminio/brand-assets --ignore-existing;
+      mc mb myminio/recordings --ignore-existing;
+      mc mb myminio/thumbnails --ignore-existing;
+      echo 'Buckets creados exitosamente';
+      exit 0;
+      "
+    networks:
+      - streamyard-net
+
+  # --- LiveKit Server --------------------------------------------------
+  # Servidor de videoconferencia (SFU - Selective Forwarding Unit).
+  # Escrito en Go, es INDEPENDIENTE de tu backend NestJS.
+  #
+  # Que hace:
+  #   - Recibe streams de video/audio de los participantes
+  #   - Los reenvia a los demas participantes (sin procesarlos)
+  #   - Permite iniciar streams RTMP a YouTube/Facebook/Twitch (Egress)
+  #   - Permite grabar sesiones a MP4/WebM (Egress)
+  #   - Genera tokens JWT para que los clientes se conecten
+  #
+  # Puertos:
+  #   - 7880: HTTP API (tu backend NestJS se comunica por aqui)
+  #   - 7881: WebRTC (TCP fallback para clientes con firewall estricto)
+  #   - 7882: WebRTC (UDP - este es el puerto principal para video)
+  #   - 50000-60000: Rango UDP para conexiones WebRTC
+  #
+  # IMPORTANTE:
+  #   - Tu backend NO es el servidor de video. LiveKit lo es.
+  #   - El frontend se conecta DIRECTO a LiveKit (no via backend).
+  #   - Tu backend solo genera tokens y controla grabaciones via API.
+  #
+  # Variables de entorno:
+  #   - LIVEKIT_URL: http://localhost:7880 (para el backend)
+  #   - LIVEKIT_API_KEY y LIVEKIT_API_SECRET: credenciales para el SDK
+
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: streamyard-livekit
+    restart: unless-stopped
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+      - "7883-7900:7883-7900/udp"
+    environment:
+      LIVEKIT_KEYS: "devkey:secretsecret"
+    command: --dev
+    networks:
+      - streamyard-net
+
+# --- Redes -------------------------------------------------------------
+# Todos los contenedores comparten esta red para comunicarse entre si
+# usando sus nombres de contenedor como hostname.
+# Ejemplo: desde el backend, postgres es accesible via "postgres:5432"
+
+networks:
+  streamyard-net:
+    driver: bridge
+
+# --- Volumenes persistentes --------------------------------------------
+# Los datos sobreviven aunque hagas "docker compose down".
+# Solo se borran con "docker compose down -v" (con la flag -v).
+#
+# - pgdata:     Base de datos PostgreSQL (tus tablas, datos)
+# - redisdata:  Datos de Redis (cache, sesiones)
+# - miniodata:  Archivos subidos (logos, grabaciones, overlays)
+
+volumes:
+  pgdata:
+    driver: local
+  redisdata:
+    driver: local
+  miniodata:
+    driver: local
